@@ -98,45 +98,6 @@ static int ltoc_table_values(lua_State *L, int idx, /* {{{ */
   return status;
 } /* }}} int ltoc_table_values */
 
-static int luaC_pushvalues(lua_State *L, const data_set_t *ds,
-                           const value_list_t *vl) /* {{{ */
-{
-  assert(vl->values_len == ds->ds_num);
-
-  lua_newtable(L);
-  for (size_t i = 0; i < vl->values_len; i++) {
-    lua_pushinteger(L, (lua_Integer)i + 1);
-    luaC_pushvalue(L, vl->values[i], ds->ds[i].type);
-    lua_settable(L, -3);
-  }
-
-  return 0;
-} /* }}} int luaC_pushvalues */
-
-static int luaC_pushdstypes(lua_State *L, const data_set_t *ds) /* {{{ */
-{
-  lua_newtable(L);
-  for (size_t i = 0; i < ds->ds_num; i++) {
-    lua_pushinteger(L, (lua_Integer)i);
-    lua_pushstring(L, DS_TYPE_TO_STRING(ds->ds[i].type));
-    lua_settable(L, -3);
-  }
-
-  return 0;
-} /* }}} int luaC_pushdstypes */
-
-static int luaC_pushdsnames(lua_State *L, const data_set_t *ds) /* {{{ */
-{
-  lua_newtable(L);
-  for (size_t i = 0; i < ds->ds_num; i++) {
-    lua_pushinteger(L, (lua_Integer)i);
-    lua_pushstring(L, ds->ds[i].name);
-    lua_settable(L, -3);
-  }
-
-  return 0;
-} /* }}} int luaC_pushdsnames */
-
 /*
  * Public functions
  */
@@ -274,38 +235,159 @@ int luaC_pushvalue(lua_State *L, value_t v, int ds_type) /* {{{ */
   return 0;
 } /* }}} int luaC_pushvalue */
 
-int luaC_pushvaluelist(lua_State *L, const data_set_t *ds,
-                       const value_list_t *vl) /* {{{ */
+int luaC_pushmetricfamily(lua_State *L, metric_family_t const *mf) /* {{{ */
 {
+  DEBUG("lua: luaC_pushmetricfamily called");
+
+  /*
+    metric_family_t is mapped to the following Lua table:
+
+    {
+      name => ...,
+      help => ...,
+      type => ...,
+      metric => {
+       [0] => {
+         label => {
+           [0] => {
+           },
+           ...
+           [N] => {
+           }
+         },
+         value => ,
+         time => ,
+         interval => ,
+         meta =>
+       },
+       ...
+       [N] => {
+         ...
+       }
+    }
+  */
+
   lua_newtable(L);
 
-  lua_pushstring(L, vl->host);
-  lua_setfield(L, -2, "host");
+  lua_pushstring(L, mf->name);
+  lua_setfield(L, -2, "name");
 
-  lua_pushstring(L, vl->plugin);
-  lua_setfield(L, -2, "plugin");
-  lua_pushstring(L, vl->plugin_instance);
-  lua_setfield(L, -2, "plugin_instance");
+  lua_pushstring(L, mf->help);
+  lua_setfield(L, -2, "help");
 
-  lua_pushstring(L, vl->type);
+  lua_pushinteger(L, (lua_Integer)mf->type);
   lua_setfield(L, -2, "type");
-  lua_pushstring(L, vl->type_instance);
-  lua_setfield(L, -2, "type_instance");
 
-  luaC_pushvalues(L, ds, vl);
-  lua_setfield(L, -2, "values");
+  if (mf->metric.num > 0) {
+    /* metric = {} */
+    lua_newtable(L);
+    DEBUG("lua: top: %d", lua_gettop(L));
+    DEBUG("lua: metric.num: %zd", mf->metric.num);
+    metric_t *ptr = mf->metric.ptr;
+    for (int i = 0; i < mf->metric.num; i++) {
+      DEBUG("lua: metric[%d]", i);
+      /* metric[N] = {} */
+      lua_newtable(L);
+      if (ptr->label.num > 0) {
+        label_pair_t *label_ptr = ptr->label.ptr;
+        /* label = {} */
+        lua_newtable(L);
+        for (int j = 0; j < ptr->label.num; j++) {
+          DEBUG("lua: metric[%d].label[%d]", i, j);
+          /* { name = value } */
+          lua_newtable(L);
+          lua_pushstring(L, label_ptr->value);
+          lua_setfield(L, -2, label_ptr->name);
+          lua_rawseti(L, -2, j + 1);
+          label_ptr++;
+          DEBUG("lua: top: %d", lua_gettop(L));
+        }
+        lua_setfield(L, -2, "label");
+      }
+      switch (mf->type) {
+      case METRIC_TYPE_COUNTER:
+        DEBUG("lua: metric[%d]", i);
+        lua_pushinteger(L, (lua_Integer)ptr->value.counter);
+        lua_setfield(L, -2, "counter");
+        break;
+      case METRIC_TYPE_GAUGE:
+        lua_pushnumber(L, ptr->value.gauge);
+        lua_setfield(L, -2, "gauge");
+        break;
+      case METRIC_TYPE_UNTYPED:
+        break;
+      }
+      luaC_pushcdtime(L, ptr->time);
+      lua_setfield(L, -2, "time");
 
-  luaC_pushdstypes(L, ds);
-  lua_setfield(L, -2, "dstypes");
+      luaC_pushcdtime(L, ptr->interval);
+      lua_setfield(L, -2, "interval");
 
-  luaC_pushdsnames(L, ds);
-  lua_setfield(L, -2, "dsnames");
+      if (ptr->meta) {
+        char **toc;
+        meta_data_t *meta = ptr->meta;
+        int meta_count = meta_data_toc(meta, &toc);
+        lua_newtable(L);
+        for (int i = 0; i < meta_count; i++) {
+          lua_newtable(L);
 
-  luaC_pushcdtime(L, vl->time);
-  lua_setfield(L, -2, "time");
+          int meta_type = meta_data_type(meta, toc[i]);
+          int exist = meta_data_exists(meta, toc[i]);
+          if (!exist) {
+            DEBUG("lua: meta_data key not found: %s", toc[i]);
+            continue;
+          }
+          lua_pushinteger(L, meta_type);
+          lua_setfield(L, -2, "type");
+          char *string;
+          int64_t i64value;
+          uint64_t u64value;
+          double dvalue;
+          bool bvalue;
+          switch (meta_type) {
+          case MD_TYPE_STRING:
+            meta_data_get_string(meta, toc[i], &string);
+            lua_pushstring(L, string);
+            break;
+          case MD_TYPE_SIGNED_INT:
+            meta_data_get_signed_int(meta, toc[i], &i64value);
+            lua_pushnumber(L, i64value);
+            break;
+          case MD_TYPE_UNSIGNED_INT:
+            meta_data_get_unsigned_int(meta, toc[i], &u64value);
+            lua_pushnumber(L, u64value);
+            break;
+          case MD_TYPE_DOUBLE:
+            meta_data_get_double(meta, toc[i], &dvalue);
+            lua_pushnumber(L, dvalue);
+            break;
+          case MD_TYPE_BOOLEAN:
+            meta_data_get_boolean(meta, toc[i], &bvalue);
+            lua_pushboolean(L, bvalue);
+            break;
+          default:
+            break;
+          }
+          lua_setfield(L, -2, toc[i]);
+          lua_rawseti(L, -2, i + 1);
+        }
+        if (meta_count > 0) {
+          lua_setfield(L, -2, "meta");
+          for (int i = 0; i < meta_count; i++) {
+            free(toc[i]);
+          }
+        }
+      }
 
-  luaC_pushcdtime(L, vl->interval);
-  lua_setfield(L, -2, "interval");
+      /* metric = { [N] = ...} */
+      lua_rawseti(L, -2, i + 1);
+      ptr++;
+    }
+    /* metric = {...} */
+    lua_setfield(L, -2, "metric");
+  }
+
+  DEBUG("lua: luaC_pushmetricfamily successfully called.");
 
   return 0;
-} /* }}} int luaC_pushvaluelist */
+} /* }}} int luaC_pushmetricfamily */
