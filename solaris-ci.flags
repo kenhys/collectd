@@ -2,7 +2,7 @@
 --disable-check_uptime
 --disable-csv
 --disable-java
---disable-lua
+--enable-lua
 --disable-match_empty_counter
 --disable-match_hashed
 --disable-match_regex

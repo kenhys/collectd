@@ -49,7 +49,7 @@ script:
     --disable-gmond
     --disable-grpc
     --disable-java
-    --disable-lua
+    --enable-lua
     --disable-match_empty_counter
     --disable-match_hashed
     --disable-match_regex
